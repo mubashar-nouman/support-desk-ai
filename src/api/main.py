@@ -118,9 +118,81 @@ async def embed(text: str, task_type: str) -> list[float]:
     return result.embeddings[0].values
 
 
+CHUNK_TARGET = 1200      # characters per chunk - small enough to stay specific
+CHUNK_OVERLAP = 200      # carry-over so facts spanning a boundary are not lost
+CHUNK_MIN = 80           # below this a fragment is page furniture, not content
+
+
+def strip_boilerplate(text: str) -> str:
+    """Remove running headers/footers that repeat on most pages of a PDF.
+
+    These short repeated lines otherwise become their own chunks and match
+    almost any query weakly, crowding real content out of the results.
+    """
+    lines = text.split("\n")
+    pages = max(1, text.count("[Page "))
+    if pages < 3:
+        return text
+
+    counts: dict[str, int] = {}
+    for line in lines:
+        stripped = line.strip()
+        if 0 < len(stripped) < 90 and not stripped.startswith("[Page "):
+            counts[stripped] = counts.get(stripped, 0) + 1
+
+    # A line repeated on at least half the pages is furniture.
+    repeated = {line for line, n in counts.items() if n >= max(3, pages // 2)}
+    if not repeated:
+        return text
+    return "\n".join(line for line in lines if line.strip() not in repeated)
+
+
+def chunk_text(text: str) -> list[str]:
+    """Split into overlapping chunks of roughly CHUNK_TARGET characters.
+
+    Paragraphs are the unit of assembly, so chunks stay semantically coherent;
+    oversized paragraphs are split further so no single chunk swallows a whole
+    section and dilutes its embedding.
+    """
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+
+    units: list[str] = []
+    for para in paragraphs:
+        if len(para) <= CHUNK_TARGET:
+            units.append(para)
+            continue
+        # Split a long paragraph on sentence boundaries.
+        sentences = re.split(r"(?<=[.!?])\s+", para)
+        buffer = ""
+        for sentence in sentences:
+            if len(buffer) + len(sentence) + 1 > CHUNK_TARGET and buffer:
+                units.append(buffer.strip())
+                buffer = sentence
+            else:
+                buffer = f"{buffer} {sentence}".strip()
+        if buffer:
+            units.append(buffer.strip())
+
+    chunks: list[str] = []
+    current = ""
+    for unit in units:
+        if len(current) + len(unit) + 2 > CHUNK_TARGET and current:
+            chunks.append(current.strip())
+            # Start the next chunk with the tail of this one for continuity.
+            current = (current[-CHUNK_OVERLAP:] + "\n\n" + unit) if CHUNK_OVERLAP else unit
+        else:
+            current = f"{current}\n\n{unit}".strip()
+    if current.strip():
+        chunks.append(current.strip())
+
+    # Keep short chunks only when nothing else survived.
+    filtered = [c for c in chunks if len(c) >= CHUNK_MIN]
+    return filtered or chunks
+
+
 async def index_file(path: Path) -> int:
-    text = extract_document(path)
-    chunks = [chunk.strip() for chunk in re.split(r"\n\s*\n", text) if chunk.strip()]
+    text = strip_boilerplate(extract_document(path))
+    chunks = chunk_text(text)
     # Drop any previous chunks for this file so re-uploads don't leave stale ones behind.
     stale = knowledge_collection.get(where={"file": path.name})
     if stale.get("ids"):
@@ -139,7 +211,7 @@ def format_excerpts(result: dict) -> list[str]:
     return [f"[{meta.get('file', 'knowledge base')}]\n{doc}" for doc, meta in zip(documents, metadatas)]
 
 
-async def find_semantic_knowledge(query: str, limit: int = 6, active_file: Optional[str] = None) -> str:
+async def find_semantic_knowledge(query: str, limit: int = 14, active_file: Optional[str] = None) -> str:
     if knowledge_collection.count() == 0:
         for path in KNOWLEDGE_DIR.iterdir():
             if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
@@ -148,28 +220,64 @@ async def find_semantic_knowledge(query: str, limit: int = 6, active_file: Optio
         return ""
     vector = await embed(query, "RETRIEVAL_QUERY")
 
-    # When the user is reading a specific document, reserve most of the context
-    # for that file so a large unrelated document cannot crowd it out, then top
-    # up with the best matches from the rest of the knowledge base.
+    # When the user is reading a specific document, spend the whole budget on it
+    # and add just two excerpts from elsewhere, so another file cannot displace
+    # the document actually on screen.
     excerpts: list[str] = []
     if active_file:
-        focused = knowledge_collection.query(
-            query_embeddings=[vector],
-            n_results=max(1, limit - 2),
-            where={"file": active_file},
-        )
-        excerpts = format_excerpts(focused)
+        available = len(knowledge_collection.get(where={"file": active_file}).get("ids", []))
+        if available:
+            focused = knowledge_collection.query(
+                query_embeddings=[vector],
+                n_results=min(limit, available),
+                where={"file": active_file},
+            )
+            excerpts = format_excerpts(focused)
 
-    remaining = limit - len(excerpts)
-    if remaining > 0:
-        others = knowledge_collection.query(
+        others_total = knowledge_collection.count() - available
+        if others_total > 0:
+            others = knowledge_collection.query(
+                query_embeddings=[vector],
+                n_results=min(2, others_total),
+                where={"file": {"$ne": active_file}},
+            )
+            excerpts.extend(format_excerpts(others))
+    else:
+        everything = knowledge_collection.query(
             query_embeddings=[vector],
-            n_results=remaining,
-            **({"where": {"file": {"$ne": active_file}}} if active_file else {}),
+            n_results=min(limit, knowledge_collection.count()),
         )
-        excerpts.extend(format_excerpts(others))
+        excerpts = format_excerpts(everything)
 
+    # Embeddings are weak at exact tokens like section numbers ("4.1") or IDs,
+    # so add any chunk that literally contains one. This keeps precise lookups
+    # working alongside semantic search.
+    excerpts.extend(lexical_excerpts(query, active_file, exclude=excerpts))
     return "\n\n".join(excerpts)
+
+
+LEXICAL_TOKEN = re.compile(r"\b(?:\d+(?:\.\d+)+|[A-Z]{2,}-?\d+|\w*\d\w*)\b")
+
+
+def lexical_excerpts(query: str, active_file: Optional[str], exclude: list[str], limit: int = 3) -> list[str]:
+    """Return chunks containing a distinctive literal token from the query."""
+    tokens = [t for t in LEXICAL_TOKEN.findall(query) if len(t) > 1]
+    if not tokens:
+        return []
+
+    where = {"file": active_file} if active_file else None
+    stored = knowledge_collection.get(where=where) if where else knowledge_collection.get()
+    documents = stored.get("documents") or []
+    metadatas = stored.get("metadatas") or []
+
+    seen = "\n\n".join(exclude)
+    found: list[str] = []
+    for doc, meta in zip(documents, metadatas):
+        if len(found) >= limit:
+            break
+        if any(token in doc for token in tokens) and doc not in seen:
+            found.append(f"[{meta.get('file', 'knowledge base')}]\n{doc}")
+    return found
 
 
 @app.get("/health")
@@ -189,6 +297,16 @@ async def upload_knowledge(file: UploadFile = File(...)) -> dict[str, object]:
         (KNOWLEDGE_DIR / filename).unlink(missing_ok=True)
         raise HTTPException(status_code=502, detail=f"Indexing failed: {exc}") from exc
     return {"filename": filename, "status": "uploaded", "chunks": chunks}
+
+@app.post("/knowledge/reindex")
+async def reindex_knowledge() -> dict[str, object]:
+    """Rebuild the vector index for every stored document."""
+    rebuilt: dict[str, int] = {}
+    for path in sorted(KNOWLEDGE_DIR.iterdir()):
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            rebuilt[path.name] = await index_file(path)
+    return {"reindexed": rebuilt, "total_chunks": sum(rebuilt.values())}
+
 
 @app.get("/knowledge/status")
 async def knowledge_status() -> dict[str, object]:
