@@ -10,9 +10,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from config import Settings, settings
 from .base import BaseProvider, LLMResponse, LLMMessage
-from .providers.claude import ClaudeProvider
-from .providers.openai import OpenAIProvider
-from .providers.gemini import GeminiProvider
+
+# Provider modules are imported lazily inside _create_provider(). Each pulls in
+# a vendor SDK, and importing all three would require every SDK to be installed
+# even when only one provider is configured - which matters for serverless
+# deployments where bundle size is capped.
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,8 @@ class LLMClient:
 
         """
         if provider_name == "claude":
+            from .providers.claude import ClaudeProvider
+
             api_key = settings.llm.claude.api_key.get_secret_value()
             # key already validated by Pydantic in Settings
             return ClaudeProvider(
@@ -107,6 +111,8 @@ class LLMClient:
             )
 
         elif provider_name == "openai":
+            from .providers.openai import OpenAIProvider
+
             api_key = settings.llm.openai.api_key.get_secret_value()
             # key already validated by Pydantic in Settings
             return OpenAIProvider(
@@ -115,6 +121,8 @@ class LLMClient:
                 timeout=settings.llm.openai.timeout
             )
         elif provider_name == "gemini":
+            from .providers.gemini import GeminiProvider
+
             return GeminiProvider(
                 api_key=settings.llm.gemini.api_key.get_secret_value(),
                 model=settings.llm.gemini.model,

@@ -8,9 +8,10 @@ import json
 import hashlib
 from typing import Optional
 
+import tempfile
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pypdf import PdfReader
-import chromadb
 from google import genai
 from google.genai import types
 from fastapi.responses import FileResponse, RedirectResponse
@@ -18,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from config import settings
+from src.api.storage import EMBED_DIMENSIONS, build_stores
 from src.llm import LLMMessage, get_llm_client
 
 
@@ -28,13 +30,26 @@ app = FastAPI(
 )
 
 WEB_DIR = Path(__file__).parent / "static"
-KNOWLEDGE_DIR = Path("data/knowledge_base")
-CHROMA_DIR = Path("data/chroma")
-KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
-CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-vector_db = chromadb.PersistentClient(path=str(CHROMA_DIR))
-knowledge_collection = vector_db.get_or_create_collection("knowledge_base")
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".log", ".pdf"}
+
+# Serverless filesystems are read-only apart from a scratch directory, so fall
+# back to one when the project directory cannot be written to.
+try:
+    KNOWLEDGE_DIR = Path("data/knowledge_base")
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    CHROMA_DIR = Path("data/chroma")
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    scratch = Path(tempfile.gettempdir()) / "support-desk-ai"
+    KNOWLEDGE_DIR = scratch / "knowledge_base"
+    CHROMA_DIR = scratch / "chroma"
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+
+document_store, vector_store = build_stores(
+    KNOWLEDGE_DIR, CHROMA_DIR, SUPPORTED_EXTENSIONS, settings
+)
+
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 
@@ -77,11 +92,16 @@ class ChatResponse(BaseModel):
     total_tokens: int
 
 
-def extract_document(path: Path) -> str:
-    suffix = path.suffix.lower()
+def extract_document(filename: str, data: bytes) -> str:
+    """Turn raw uploaded bytes into indexable text."""
+    suffix = Path(filename).suffix.lower()
     if suffix == ".pdf":
-        return "\n\n".join(f"[Page {i}]\n{page.extract_text() or ''}" for i, page in enumerate(PdfReader(str(path)).pages, 1))
-    raw = path.read_text(encoding="utf-8", errors="ignore")
+        reader = PdfReader(io.BytesIO(data))
+        return "\n\n".join(
+            f"[Page {i}]\n{page.extract_text() or ''}"
+            for i, page in enumerate(reader.pages, 1)
+        )
+    raw = data.decode("utf-8", errors="ignore")
     if suffix == ".csv":
         rows = list(csv.DictReader(io.StringIO(raw)))
         return "\n\n".join(f"[CSV record {i}]\n" + "\n".join(f"{k}: {v}" for k, v in row.items() if v) for i, row in enumerate(rows, 1))
@@ -93,27 +113,14 @@ def extract_document(path: Path) -> str:
     return raw
 
 
-def find_knowledge(query: str, limit: int = 6) -> str:
-    terms = set(re.findall(r"[a-zA-Z0-9]{3,}", query.lower()))
-    matches: list[tuple[int, str, str]] = []
-    for path in KNOWLEDGE_DIR.iterdir():
-        if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            continue
-        text = extract_document(path)
-        for chunk in re.split(r"\n\s*\n", text):
-            score = sum(term in chunk.lower() for term in terms)
-            if score:
-                matches.append((score, path.name, chunk.strip()[:1800]))
-    matches.sort(key=lambda item: item[0], reverse=True)
-    return "\n\n".join(f"[{name}]\n{chunk}" for _, name, chunk in matches[:limit])
-
-
 async def embed(text: str, task_type: str) -> list[float]:
     client = genai.Client(api_key=settings.llm.gemini.api_key.get_secret_value())
     result = await client.aio.models.embed_content(
         model="gemini-embedding-001",
         contents=text,
-        config=types.EmbedContentConfig(task_type=task_type, output_dimensionality=768),
+        config=types.EmbedContentConfig(
+            task_type=task_type, output_dimensionality=EMBED_DIMENSIONS
+        ),
     )
     return result.embeddings[0].values
 
@@ -190,33 +197,36 @@ def chunk_text(text: str) -> list[str]:
     return filtered or chunks
 
 
-async def index_file(path: Path) -> int:
-    text = strip_boilerplate(extract_document(path))
+async def index_file(filename: str, data: bytes) -> int:
+    text = strip_boilerplate(extract_document(filename, data))
     chunks = chunk_text(text)
     # Drop any previous chunks for this file so re-uploads don't leave stale ones behind.
-    stale = knowledge_collection.get(where={"file": path.name})
-    if stale.get("ids"):
-        knowledge_collection.delete(ids=stale["ids"])
+    vector_store.delete_file(filename)
     if not chunks:
         return 0
-    ids = [hashlib.sha1(f"{path.name}:{i}".encode()).hexdigest() for i in range(len(chunks))]
+    ids = [hashlib.sha1(f"{filename}:{i}".encode()).hexdigest() for i in range(len(chunks))]
     vectors = [await embed(chunk, "RETRIEVAL_DOCUMENT") for chunk in chunks]
-    knowledge_collection.upsert(ids=ids, documents=chunks, embeddings=vectors, metadatas=[{"file": path.name} for _ in chunks])
+    vector_store.upsert(ids=ids, documents=chunks, embeddings=vectors, file=filename)
     return len(chunks)
 
 
-def format_excerpts(result: dict) -> list[str]:
-    documents = result.get("documents", [[]])[0]
-    metadatas = result.get("metadatas", [[]])[0]
-    return [f"[{meta.get('file', 'knowledge base')}]\n{doc}" for doc, meta in zip(documents, metadatas)]
+def format_excerpts(rows: list[tuple[str, str]]) -> list[str]:
+    return [f"[{file or 'knowledge base'}]\n{text}" for file, text in rows]
+
+
+async def ensure_indexed() -> None:
+    """Index any stored document that is missing from the vector store."""
+    if vector_store.count():
+        return
+    for filename in await document_store.list():
+        data = await document_store.get(filename)
+        if data:
+            await index_file(filename, data)
 
 
 async def find_semantic_knowledge(query: str, limit: int = 14, active_file: Optional[str] = None) -> str:
-    if knowledge_collection.count() == 0:
-        for path in KNOWLEDGE_DIR.iterdir():
-            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                await index_file(path)
-    if knowledge_collection.count() == 0:
+    await ensure_indexed()
+    if vector_store.count() == 0:
         return ""
     vector = await embed(query, "RETRIEVAL_QUERY")
 
@@ -225,29 +235,20 @@ async def find_semantic_knowledge(query: str, limit: int = 14, active_file: Opti
     # the document actually on screen.
     excerpts: list[str] = []
     if active_file:
-        available = len(knowledge_collection.get(where={"file": active_file}).get("ids", []))
+        available = vector_store.count_file(active_file)
         if available:
-            focused = knowledge_collection.query(
-                query_embeddings=[vector],
-                n_results=min(limit, available),
-                where={"file": active_file},
+            excerpts = format_excerpts(
+                vector_store.query(vector, min(limit, available), file=active_file)
             )
-            excerpts = format_excerpts(focused)
 
-        others_total = knowledge_collection.count() - available
-        if others_total > 0:
-            others = knowledge_collection.query(
-                query_embeddings=[vector],
-                n_results=min(2, others_total),
-                where={"file": {"$ne": active_file}},
+        if vector_store.count() - available > 0:
+            excerpts.extend(
+                format_excerpts(vector_store.query(vector, 2, exclude_file=active_file))
             )
-            excerpts.extend(format_excerpts(others))
     else:
-        everything = knowledge_collection.query(
-            query_embeddings=[vector],
-            n_results=min(limit, knowledge_collection.count()),
+        excerpts = format_excerpts(
+            vector_store.query(vector, min(limit, vector_store.count()))
         )
-        excerpts = format_excerpts(everything)
 
     # Embeddings are weak at exact tokens like section numbers ("4.1") or IDs,
     # so add any chunk that literally contains one. This keeps precise lookups
@@ -265,18 +266,13 @@ def lexical_excerpts(query: str, active_file: Optional[str], exclude: list[str],
     if not tokens:
         return []
 
-    where = {"file": active_file} if active_file else None
-    stored = knowledge_collection.get(where=where) if where else knowledge_collection.get()
-    documents = stored.get("documents") or []
-    metadatas = stored.get("metadatas") or []
-
     seen = "\n\n".join(exclude)
     found: list[str] = []
-    for doc, meta in zip(documents, metadatas):
+    for file, text in vector_store.chunks_for(active_file):
         if len(found) >= limit:
             break
-        if any(token in doc for token in tokens) and doc not in seen:
-            found.append(f"[{meta.get('file', 'knowledge base')}]\n{doc}")
+        if any(token in text for token in tokens) and text not in seen:
+            found.append(f"[{file or 'knowledge base'}]\n{text}")
     return found
 
 
@@ -290,71 +286,76 @@ async def upload_knowledge(file: UploadFile = File(...)) -> dict[str, object]:
     filename = Path(file.filename or "").name
     if not filename or Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
         raise HTTPException(status_code=400, detail="Supported files: .txt, .md, .csv, .json, .log, .pdf")
-    (KNOWLEDGE_DIR / filename).write_bytes(await file.read())
+    data = await file.read()
+    await document_store.put(filename, data)
     try:
-        chunks = await index_file(KNOWLEDGE_DIR / filename)
+        chunks = await index_file(filename, data)
     except Exception as exc:
-        (KNOWLEDGE_DIR / filename).unlink(missing_ok=True)
+        await document_store.delete(filename)
         raise HTTPException(status_code=502, detail=f"Indexing failed: {exc}") from exc
     return {"filename": filename, "status": "uploaded", "chunks": chunks}
+
 
 @app.post("/knowledge/reindex")
 async def reindex_knowledge() -> dict[str, object]:
     """Rebuild the vector index for every stored document."""
     rebuilt: dict[str, int] = {}
-    for path in sorted(KNOWLEDGE_DIR.iterdir()):
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-            rebuilt[path.name] = await index_file(path)
+    for filename in await document_store.list():
+        data = await document_store.get(filename)
+        if data is not None:
+            rebuilt[filename] = await index_file(filename, data)
     return {"reindexed": rebuilt, "total_chunks": sum(rebuilt.values())}
 
 
 @app.get("/knowledge/status")
 async def knowledge_status() -> dict[str, object]:
-    files = [p.name for p in KNOWLEDGE_DIR.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS]
+    files = [
+        name for name in await document_store.list()
+        if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
     return {"ready": bool(files), "files": files}
 
 
-def resolve_knowledge_file(filename: str) -> Path:
-    """Resolve a knowledge-base filename, rejecting anything outside KNOWLEDGE_DIR."""
+def validate_filename(filename: str) -> str:
+    """Reject path traversal and unsupported extensions."""
     if Path(filename).name != filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
-    path = KNOWLEDGE_DIR / filename
-    if path.suffix.lower() not in SUPPORTED_EXTENSIONS or not path.is_file():
+    if Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
         raise HTTPException(status_code=404, detail="File not found")
-    return path
+    return filename
 
 
 @app.get("/knowledge/document/{filename}")
 async def knowledge_document(filename: str) -> dict[str, object]:
     """Return the extracted text of an uploaded document for side-by-side viewing."""
-    path = resolve_knowledge_file(filename)
-    text = extract_document(path)
+    name = validate_filename(filename)
+    data = await document_store.get(name)
+    if data is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    text = extract_document(name, data)
     return {
-        "filename": path.name,
+        "filename": name,
         "content": text,
         "characters": len(text),
-        "size_kb": round(path.stat().st_size / 1024, 1),
+        "size_kb": round(len(data) / 1024, 1),
     }
 
 
 @app.delete("/knowledge/document/{filename}")
 async def delete_knowledge_document(filename: str) -> dict[str, str]:
-    """Remove a document from disk and drop its chunks from the vector index."""
-    path = resolve_knowledge_file(filename)
-    existing = knowledge_collection.get(where={"file": path.name})
-    if existing.get("ids"):
-        knowledge_collection.delete(ids=existing["ids"])
-    path.unlink()
-    return {"filename": path.name, "status": "deleted"}
+    """Remove a document from storage and drop its chunks from the vector index."""
+    name = validate_filename(filename)
+    if await document_store.get(name) is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    vector_store.delete_file(name)
+    await document_store.delete(name)
+    return {"filename": name, "status": "deleted"}
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     """Generate a customer-service response using the configured LLM provider."""
-    if not any(
-        path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
-        for path in KNOWLEDGE_DIR.iterdir()
-    ):
+    if not await document_store.list():
         raise HTTPException(status_code=400, detail="Upload a knowledge file before chatting.")
     try:
         active_file = Path(request.active_file).name if request.active_file else None

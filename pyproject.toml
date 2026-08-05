@@ -59,6 +59,10 @@ dev = [
     "jupyter>=1.0.0",
 ]
 
+[tool.vercel]
+# main.py only launches uvicorn; the ASGI app itself lives in src/api/main.py.
+entrypoint = "src.api.main:app"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -1,0 +1,18 @@
+# Local-only artifacts that must never enter the serverless bundle.
+.venv/
+venv/
+data/
+tests/
+scripts/
+docs/
+*.md
+!README.md
+.env
+.env.*
+!.env.production.example
+__pycache__/
+*.pyc
+.pytest_cache/
+htmlcov/
+.git/
+uv.lock
