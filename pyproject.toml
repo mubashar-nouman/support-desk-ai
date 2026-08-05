@@ -10,35 +10,33 @@ requires-python = ">=3.11"
 packages = [{include = "src"}]
 license = {text = "MIT"}
 
+# Runtime dependencies. Keep this list in sync with requirements.txt - Vercel
+# installs from this file, not from requirements.txt.
+#
+# Deliberately excluded: torch, transformers, sentence-transformers, langchain,
+# langgraph, pinecone, sqlalchemy, asyncpg, redis and chromadb. Nothing in src/
+# or config/ imports them, and together they pushed the serverless bundle past
+# the 500 MB function limit. Provider SDKs are loaded lazily by src/llm, so only
+# the configured provider's SDK is required.
 dependencies = [
     # Core Framework
     "fastapi>=0.109.0",
     "python-multipart>=0.0.9",
-    "pypdf>=5.0.0",
-    "pdfplumber>=0.11.0",
     "uvicorn[standard]>=0.27.0",
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
     "email-validator>=2.1.0",
-    
-    # AI/ML
-    "anthropic>=0.18.0",
-    "openai>=1.12.0",
+
+    # Document extraction
+    "pypdf>=5.0.0",
+    "pdfplumber>=0.11.0",
+
+    # LLM provider (Gemini)
     "google-genai>=1.0.0",
-    "langchain>=0.1.0",
-    "langchain-anthropic>=0.1.0",
-    "langgraph>=0.0.20",
-    
-    # Vector Store & Embeddings
-    "sentence-transformers>=2.3.0",
-    "pinecone-client>=3.0.0",
-    "chromadb>=0.4.0",
-    
-    # Database
-    "sqlalchemy>=2.0.0",
-    "asyncpg>=0.29.0",
-    "redis>=5.0.0",
-    
+
+    # Vector store
+    "qdrant-client>=1.7.0",
+
     # Utilities
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.0",
@@ -48,6 +46,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Local development: ChromaDB lets the app run with no external services.
+# Install with: pip install -e ".[local]"
+local = [
+    "chromadb>=0.4.0",
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.23.0",
