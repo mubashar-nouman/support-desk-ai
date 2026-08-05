@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Support Desk AI</title>
+  <link rel="stylesheet" href="/static/styles.css?v=4">
+</head>
+<body>
+<div class="app">
+
+  <!-- ── Top bar ───────────────────────────────────────────── -->
+  <header class="bar">
+    <div class="brand"><span class="brand-mark">✦</span><span>Support Desk <b>AI</b></span></div>
+    <div class="bar-right">
+      <span id="doc-status" class="status-pill" hidden><span class="dot"></span><span id="doc-count"></span></span>
+      <button id="add-doc" class="ghost-btn" hidden>＋ Add document</button>
+    </div>
+  </header>
+
+  <!-- ── Upload screen (shown until the first document exists) ── -->
+  <section id="upload-view" class="upload-view" hidden>
+    <div class="upload-inner">
+      <div class="eyebrow">SUPPORT DESK AI</div>
+      <h1>Upload a document.<br><em>Start the conversation.</em></h1>
+      <p class="lead">Your document opens beside the assistant, so you can read the source and ask questions about it at the same time.</p>
+
+      <label class="dropzone" id="dropzone">
+        <input id="files" type="file" multiple accept=".txt,.md,.csv,.json,.log,.pdf">
+        <span class="drop-icon">↑</span>
+        <strong>Drop files here or click to browse</strong>
+        <small>TXT · MD · CSV · JSON · LOG · PDF</small>
+      </label>
+
+      <div id="file-list" class="file-list"></div>
+      <button id="upload" class="primary" disabled>Upload and open</button>
+      <p id="status" class="upload-status" role="status"></p>
+    </div>
+  </section>
+
+  <!-- ── Workspace: document | chat ─────────────────────────── -->
+  <main id="workspace" class="workspace-split" hidden>
+    <section class="doc-pane" aria-label="Document">
+      <header class="pane-head">
+        <div class="pane-title">
+          <small>SOURCE DOCUMENT</small>
+          <select id="doc-select" aria-label="Select document"></select>
+        </div>
+        <div class="doc-tools">
+          <div class="finder">
+            <input id="doc-search" type="search" placeholder="Find in document" aria-label="Find in document">
+            <span id="find-count" class="find-count"></span>
+          </div>
+          <button id="find-prev" class="icon-btn" title="Previous match" aria-label="Previous match">↑</button>
+          <button id="find-next" class="icon-btn" title="Next match" aria-label="Next match">↓</button>
+        </div>
+      </header>
+      <div id="doc-body" class="doc-body" tabindex="0"></div>
+      <footer id="doc-meta" class="pane-foot"></footer>
+    </section>
+
+    <div id="divider" class="divider" role="separator" aria-orientation="vertical" tabindex="0"
+         aria-label="Resize panels" title="Drag to resize · double-click to reset"><span></span></div>
+
+    <section class="chat-pane" aria-label="Chat">
+      <header class="pane-head">
+        <div class="pane-title">
+          <small>AI ASSISTANT</small>
+          <h2>Ask about this document</h2>
+        </div>
+        <button id="clear" class="ghost-btn">＋ New chat</button>
+      </header>
+      <div id="messages" class="messages"></div>
+      <div id="suggestions" class="suggestions"></div>
+      <form id="chat-form" class="composer">
+        <textarea id="message" rows="1" placeholder="Ask a question about this document…" required></textarea>
+        <button type="submit" aria-label="Send">➜</button>
+      </form>
+      <p class="privacy">AI-generated responses can make mistakes. Please verify important details.</p>
+    </section>
+  </main>
+
+  <!-- ── Add-document overlay (used once a workspace exists) ── -->
+  <div id="overlay" class="overlay" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-label="Manage documents">
+      <div class="sheet-head">
+        <h3>Add a document</h3>
+        <button id="overlay-close" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <label class="dropzone compact" id="dropzone2">
+        <input id="files2" type="file" multiple accept=".txt,.md,.csv,.json,.log,.pdf">
+        <span class="drop-icon">↑</span>
+        <strong>Drop files or click to browse</strong>
+        <small>TXT · MD · CSV · JSON · LOG · PDF</small>
+      </label>
+      <div id="file-list2" class="file-list"></div>
+      <button id="upload2" class="primary" disabled>Upload and open</button>
+      <p id="status2" class="upload-status" role="status"></p>
+      <div class="sheet-docs" id="sheet-docs"></div>
+    </div>
+  </div>
+
+</div>
+<script src="/static/app.js?v=4"></script>
+</body>
+</html>
